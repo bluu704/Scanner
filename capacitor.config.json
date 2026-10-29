@@ -1,0 +1,7 @@
+{
+  "appId": "app.pocketscanner.scanner",
+  "appName": "Scanner",
+  "webDir": "www",
+  "android": { "backgroundColor": "#EDF0F4" },
+  "plugins": { "SystemBars": { "insetsHandling": "css", "initialViewportFitValueHint": "cover" } }
+}
