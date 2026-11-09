@@ -165,7 +165,6 @@ main { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding-block: 1
 .cam-bottom .shutter { width: 78px; height: 78px; border-color: var(--scr-fg); }
 .cam-bottom .shutter span { background: var(--scr-fg); }
 .cam-bottom .dbtn { width: 52px; height: 52px; background: var(--scr-raise); }
-.cam-auto { justify-self: start; display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 12px; color: var(--scr-muted); }
 .flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; z-index: 3; }
 .flash.on { animation: flash .28s ease-out; }
 @keyframes flash { from { opacity: .8; } to { opacity: 0; } }
@@ -353,7 +352,7 @@ input[type="range"]:disabled { opacity: .35; }
     <button class="dbtn" id="camTorch" aria-label="플래시" title="플래시" aria-pressed="false" hidden><svg class="i"><use href="#i-flash"/></svg></button>
   </div>
   <div class="cam-bottom">
-    <span class="cam-auto" id="camAuto"><svg class="i sm"><use href="#i-crop"/></svg>AUTO</span>
+    <span></span>
     <button class="shutter" id="camShutter" aria-label="찍기"><span></span></button>
     <button class="dbtn" id="camDone" style="justify-self:end" aria-label="촬영 끝내기" title="완료"><svg class="i"><use href="#i-check"/></svg><span class="badge" id="camCount" hidden>0</span></button>
   </div>
@@ -451,10 +450,8 @@ input[type="range"]:disabled { opacity: .35; }
       <div class="set-list">
         <div class="set-row" id="rowCrop">
           <span class="ico"><svg class="i"><use href="#i-crop"/></svg></span>
-          <span class="txt"><b id="lblCrop">자르기</b></span>
-          <div class="mini-seg" id="setCropMode" role="radiogroup" aria-labelledby="lblCrop">
-            <button role="radio" data-v="auto">자동</button><button role="radio" data-v="manual">수동</button><button role="radio" data-v="off">끔</button>
-          </div>
+          <span class="txt"><b id="lblCrop">자동 자르기</b></span>
+          <label class="switch"><input type="checkbox" id="setCrop" aria-labelledby="lblCrop"><span></span></label>
         </div>
         <div class="set-row" id="rowFlat">
           <span class="ico"><svg class="i"><use href="#i-book"/></svg></span>
@@ -519,10 +516,11 @@ if (native) {
 
 /* ---------- settings ---------- */
 const SETTINGS_KEY = 'pocket-scanner.settings';
-// cropMode: 'auto' crops silently, 'manual' asks for the four corners after each shot, 'off' keeps the whole photo
+// cropMode: 'auto' crops each shot (corners can be fixed later with the crop tool), 'off' keeps the whole photo
 const settings = { flatten: true, deskew: true, deglare: true, theme: 'system' };
 try { Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')); } catch {}
-if (!['auto', 'manual', 'off'].includes(settings.cropMode)) settings.cropMode = settings.autoCrop === false ? 'off' : 'auto';
+if (settings.cropMode === 'manual') settings.cropMode = 'auto';
+if (!['auto', 'off'].includes(settings.cropMode)) settings.cropMode = settings.autoCrop === false ? 'off' : 'auto';
 delete settings.autoCrop;
 function saveSettings() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} }
 function applyTheme() {
@@ -786,6 +784,42 @@ function detectDoc(src, maxSide = 400) {
    Walk outward from each quad side to the real paper edge;
    the offsets become the four boundary curves for flattening.
    ========================================================= */
+function fitBow(offs, ok, N) {
+  const basis = (s) => { const w = s * (1 - s); return [w, w * s, w * s * s]; };
+  let use = Uint8Array.from(ok), coef = [0, 0, 0];
+  for (let pass = 0; pass < 2; pass++) {
+    const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], r = [0, 0, 0];
+    let n = 0;
+    for (let k = 0; k < N; k++) if (use[k]) {
+      const f = basis((k + 1) / (N + 1));
+      for (let a = 0; a < 3; a++) { r[a] += f[a] * offs[k]; for (let b = 0; b < 3; b++) M[a][b] += f[a] * f[b]; }
+      n++;
+    }
+    if (n < 6) return null;
+    for (let a = 0; a < 3; a++) M[a][a] += 1e-6;
+    coef = solve3(M, r);
+    if (!coef) return null;
+    // drop outliers (a finger, a notch in the mask) and refit once
+    const res = [];
+    for (let k = 0; k < N; k++) if (use[k]) { const f = basis((k + 1) / (N + 1)); res.push(Math.abs(offs[k] - (coef[0] * f[0] + coef[1] * f[1] + coef[2] * f[2]))); }
+    const lim = Math.max(1, 2.5 * res.slice().sort((x, y) => x - y)[res.length >> 1]);
+    for (let k = 0; k < N; k++) if (use[k]) { const f = basis((k + 1) / (N + 1)); if (Math.abs(offs[k] - (coef[0] * f[0] + coef[1] * f[1] + coef[2] * f[2])) > lim) use[k] = 0; }
+  }
+  const vals = new Float32Array(N);
+  let se = 0, n = 0;
+  for (let k = 0; k < N; k++) {
+    const f = basis((k + 1) / (N + 1));
+    vals[k] = coef[0] * f[0] + coef[1] * f[1] + coef[2] * f[2];
+    if (use[k]) { se += (offs[k] - vals[k]) ** 2; n++; }
+  }
+  return { vals, rms: Math.sqrt(se / Math.max(1, n)) };
+}
+function solve3(M, r) {
+  const det3 = (m) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const D = det3(M);
+  if (Math.abs(D) < 1e-12) return null;
+  return [0, 1, 2].map((c) => det3(M.map((row, i) => row.map((v, j) => (j === c ? r[i] : v)))) / D);
+}
 function findCurves(det, quad) {
   const { mask, mw, mh } = det;
   const q = quad.map(([x, y]) => [x * mw, y * mh]);
@@ -809,17 +843,11 @@ function findCurves(det, quad) {
         if (!inside(px + nx * t, py + ny * t)) { offs[k] = t - 0.5; ok[k] = 1; valid++; break; }
       }
     }
-    if (valid < N * 0.7) { offs.fill(0); }
-    else {
-      for (let k = 0; k < N; k++) if (!ok[k]) {
-        let a = k - 1, b = k + 1;
-        while (a >= 0 && !ok[a]) a--;
-        while (b < N && !ok[b]) b++;
-        offs[k] = a < 0 ? offs[b] : b >= N ? offs[a] : offs[a] + ((offs[b] - offs[a]) * (k - a)) / (b - a);
-      }
-      const med = Float32Array.from(offs, (v, k) => [offs[Math.max(0, k - 1)], v, offs[Math.min(N - 1, k + 1)]].sort((p, r) => p - r)[1]);
-      for (let k = 0; k < N; k++) offs[k] = (med[Math.max(0, k - 1)] + 2 * med[k] + med[Math.min(N - 1, k + 1)]) / 4;
-    }
+    // a curled edge is a smooth bow: fit off(s) = s(1-s)(a + b s + c s^2), which is 0 at both corners.
+    // Mask edges are pixel-stepped, so following them point by point makes the page ripple.
+    const fit = valid >= N * 0.7 ? fitBow(offs, ok, N) : null;
+    if (!fit || fit.rms > 0.006 * diag) offs.fill(0);
+    else offs.set(fit.vals);
     const pts = [[A[0] / mw, A[1] / mh]];
     for (let k = 0; k < N; k++) {
       const s = (k + 1) / (N + 1);
@@ -982,12 +1010,14 @@ function deskew(canvas) {
 /* page geometry: crop/flatten (settings or the page's manual crop), then deskew */
 function geometry(det, crop, src) {
   let quad = null;
-  if (crop && crop.quad) quad = crop.quad;
+  const manual = !!(crop && crop.quad);
+  if (manual) quad = crop.quad;
   else if (!crop && settings.cropMode === 'auto' && det) quad = det.quad;
   const info = { cropped: !!quad, flattened: false, angle: 0 };
   let c = src;
   if (quad) {
-    const curves = settings.flatten && det ? findCurves(det, quad) : null;
+    // corners the user placed get straight edges; only the auto outline is followed for curl
+    const curves = !manual && settings.flatten && det ? findCurves(det, quad) : null;
     info.flattened = !!curves;
     c = warp(src, quad, curves);
   }
@@ -1386,8 +1416,6 @@ fileInput.onchange = async () => {
   store.order();
   main.scrollTo({ top: main.scrollHeight, behavior: 'smooth' });
   toast(ok ? `${ok}장 추가됨${bad ? ` · ${bad}장은 열 수 없는 형식` : ''}` : '사진을 열 수 없어요. JPG나 PNG로 다시 골라주세요.');
-  // manual mode: walk through the new pages' corners one by one
-  if (settings.cropMode === 'manual' && added.length) { cropQueue = added; cropTotal = added.length; nextInQueue(); }
 };
 let cropQueue = [], cropTotal = 0;
 function nextInQueue() {
@@ -1425,8 +1453,6 @@ async function startCamera() {
   const caps = track && track.getCapabilities ? track.getCapabilities() : {};
   $('#camTorch').hidden = !caps.torch;
   $('#camTorch').setAttribute('aria-pressed', 'false');
-  $('#camAuto').hidden = settings.cropMode === 'off';
-  $('#camAuto').lastChild.textContent = settings.cropMode === 'manual' ? 'MANUAL' : 'AUTO';
   updateCamCount();
   $('#camera').hidden = false;
   camQuad = null;
@@ -1495,12 +1521,12 @@ $('#camShutter').onclick = async () => {
   const c = scaledCanvas(video, video.videoWidth, video.videoHeight, MAX_SRC);
   const page = newPage(await canvasToBlob(c, 0.92));
   ensureDet(page, c);
-  openEditor(page, { isNew: true, fromCamera: true, cropFirst: settings.cropMode === 'manual' });
+  openEditor(page, { isNew: true, fromCamera: true });
 };
 $('#camInput').onchange = async () => {
   const f = $('#camInput').files[0];
   if (!f) { if (camSession && !camSession.live && !camSession.count) camSession = null; return; }
-  try { openEditor(await pageFromFile(f), { isNew: true, fromCamera: true, cropFirst: settings.cropMode === 'manual' }); }
+  try { openEditor(await pageFromFile(f), { isNew: true, fromCamera: true }); }
   catch { toast('사진을 열 수 없어요. 다시 찍어주세요.'); }
 };
 
@@ -1806,7 +1832,7 @@ $('#cropApply').onclick = () => applyCrop(ed.draftAuto ? undefined : isFull(ed.d
    ========================================================= */
 function syncSettings() {
   document.querySelectorAll('#setTheme button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.v === settings.theme)));
-  document.querySelectorAll('#setCropMode button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.v === settings.cropMode)));
+  $('#setCrop').checked = settings.cropMode === 'auto';
   $('#setFlat').checked = settings.flatten;
   $('#setSkew').checked = settings.deskew;
   $('#setGlare').checked = settings.deglare;
@@ -1821,10 +1847,8 @@ $('#setTheme').addEventListener('click', (e) => {
 });
 let rethumbTimer = 0;
 const rethumbAll = () => { clearTimeout(rethumbTimer); rethumbTimer = setTimeout(() => pages.forEach(queueThumb), 250); };
-$('#setCropMode').addEventListener('click', (e) => {
-  const b = e.target.closest('button');
-  if (!b || b.dataset.v === settings.cropMode) return;
-  settings.cropMode = b.dataset.v;
+$('#setCrop').addEventListener('change', (e) => {
+  settings.cropMode = e.target.checked ? 'auto' : 'off';
   saveSettings(); syncSettings();
   rethumbAll();
 });
