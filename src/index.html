@@ -193,9 +193,18 @@ input[type="range"]:disabled { opacity: .35; }
 .crop-ui { position: absolute; inset: 0; }
 .crop-ui svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
 .crop-ui polygon { fill: color-mix(in srgb, var(--scr-accent) 18%, transparent); stroke: var(--scr-accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
-.handle { position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px; display: grid; place-items: center; touch-action: none; cursor: grab; }
-.handle::after { content: ""; width: 20px; height: 20px; border-radius: 50%; background: var(--scr-fg); border: 3px solid var(--scr-accent); box-shadow: 0 1px 4px rgb(0 0 0 / .6); }
-.loupe { position: absolute; width: 104px; height: 104px; border-radius: 50%; border: 3px solid var(--scr-fg); box-shadow: 0 4px 16px rgb(0 0 0 / .6); pointer-events: none; margin: -52px 0 0 -52px; background: var(--scr-bg); }
+.crop-ui { pointer-events: none; }
+.crop-ui .shade { fill: rgb(0 0 0 / .5); fill-rule: evenodd; stroke: none; }
+.handle { position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px; border-radius: 50%; background: var(--scr-fg); border: 3px solid var(--scr-accent); box-shadow: 0 1px 4px rgb(0 0 0 / .6); transition: transform .1s, background .1s; }
+.handle.active { transform: scale(1.3); background: var(--scr-accent); }
+.ed-stage.cropping { touch-action: none; cursor: crosshair; }
+/* magnifier: a separate zoomed view in the top corner away from the finger */
+.loupe { position: absolute; top: 10px; width: 150px; height: 150px; border-radius: 18px; border: 3px solid var(--scr-fg); box-shadow: 0 6px 20px rgb(0 0 0 / .6); pointer-events: none; background: var(--scr-bg); z-index: 4; }
+.loupe.left { left: 14px; }
+.loupe.right { right: 14px; }
+.mini-seg { display: grid; grid-auto-flow: column; gap: 2px; padding: 3px; border-radius: 10px; background: var(--bg); flex: none; }
+.mini-seg button { height: 32px; padding: 0 11px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.mini-seg button[aria-checked="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgb(0 0 0 / .15); }
 
 /* ---------- sheets ---------- */
 .sheet-wrap { position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column; justify-content: flex-end; }
@@ -349,14 +358,14 @@ input[type="range"]:disabled { opacity: .35; }
     <div class="ed-sheet" id="edSheet">
       <canvas id="edCanvas" width="3" height="4"></canvas>
       <div class="crop-ui" id="cropUI" hidden>
-        <svg viewBox="0 0 100 100" preserveAspectRatio="none"><polygon id="cropPoly" points=""/></svg>
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none"><path class="shade" id="cropShade" d=""/><polygon id="cropPoly" points=""/></svg>
         <div class="handle" data-k="0"></div><div class="handle" data-k="1"></div><div class="handle" data-k="2"></div><div class="handle" data-k="3"></div>
-        <canvas class="loupe" id="loupe" width="208" height="208" hidden></canvas>
       </div>
     </div>
     <div class="chip" id="edGlare" hidden title="빛 반사 보정"><svg class="i sm"><use href="#i-sparkle"/></svg><span></span></div>
     <div class="chip" id="edFix" hidden></div>
     <div class="chip" id="edChip" aria-live="polite"></div>
+    <canvas class="loupe" id="loupe" width="300" height="300" hidden></canvas>
     <div class="ed-busy sweep" id="edBusy" hidden><span class="sr">처리 중</span></div>
     <button class="compare" id="edCompare" aria-pressed="false" aria-label="누르고 있으면 원본 사진" title="누르고 있으면 원본"><svg class="i"><use href="#i-compare"/></svg></button>
   </div>
@@ -429,8 +438,10 @@ input[type="range"]:disabled { opacity: .35; }
       <div class="set-list">
         <div class="set-row" id="rowCrop">
           <span class="ico"><svg class="i"><use href="#i-crop"/></svg></span>
-          <span class="txt"><b id="lblCrop">자동 자르기</b></span>
-          <label class="switch"><input type="checkbox" id="setCrop" aria-labelledby="lblCrop"><span></span></label>
+          <span class="txt"><b id="lblCrop">자르기</b></span>
+          <div class="mini-seg" id="setCropMode" role="radiogroup" aria-labelledby="lblCrop">
+            <button role="radio" data-v="auto">자동</button><button role="radio" data-v="manual">수동</button><button role="radio" data-v="off">끔</button>
+          </div>
         </div>
         <div class="set-row" id="rowFlat">
           <span class="ico"><svg class="i"><use href="#i-book"/></svg></span>
@@ -495,8 +506,11 @@ if (native) {
 
 /* ---------- settings ---------- */
 const SETTINGS_KEY = 'pocket-scanner.settings';
-const settings = { autoCrop: true, flatten: true, deskew: true, deglare: true, theme: 'system' };
+// cropMode: 'auto' crops silently, 'manual' asks for the four corners after each shot, 'off' keeps the whole photo
+const settings = { flatten: true, deskew: true, deglare: true, theme: 'system' };
 try { Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')); } catch {}
+if (!['auto', 'manual', 'off'].includes(settings.cropMode)) settings.cropMode = settings.autoCrop === false ? 'off' : 'auto';
+delete settings.autoCrop;
 function saveSettings() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} }
 function applyTheme() {
   if (settings.theme === 'system') delete document.documentElement.dataset.appTheme;
@@ -956,7 +970,7 @@ function deskew(canvas) {
 function geometry(det, crop, src) {
   let quad = null;
   if (crop && crop.quad) quad = crop.quad;
-  else if (!crop && settings.autoCrop && det) quad = det.quad;
+  else if (!crop && settings.cropMode === 'auto' && det) quad = det.quad;
   const info = { cropped: !!quad, flattened: false, angle: 0 };
   let c = src;
   if (quad) {
@@ -1350,15 +1364,24 @@ fileInput.onchange = async () => {
   const files = [...fileInput.files];
   if (!files.length) return;
   let ok = 0, bad = 0;
+  const added = [];
   toast(`${files.length}장 불러오는 중…`);
   for (const f of files) {
-    try { const p = await pageFromFile(f); pages.push(p); ok++; renderGrid(); store.save([p]); queueThumb(p); }
+    try { const p = await pageFromFile(f); pages.push(p); added.push(p); ok++; renderGrid(); store.save([p]); queueThumb(p); }
     catch { bad++; }
   }
   store.order();
   main.scrollTo({ top: main.scrollHeight, behavior: 'smooth' });
   toast(ok ? `${ok}장 추가됨${bad ? ` · ${bad}장은 열 수 없는 형식` : ''}` : '사진을 열 수 없어요. JPG나 PNG로 다시 골라주세요.');
+  // manual mode: walk through the new pages' corners one by one
+  if (settings.cropMode === 'manual' && added.length) { cropQueue = added; cropTotal = added.length; nextInQueue(); }
 };
+let cropQueue = [], cropTotal = 0;
+function nextInQueue() {
+  const p = cropQueue.shift();
+  if (p && pages.includes(p)) openEditor(p, { isNew: false, cropFirst: true, step: `${cropTotal - cropQueue.length}/${cropTotal}` });
+  else if (cropQueue.length) nextInQueue();
+}
 
 /* =========================================================
    Camera (live document outline while aiming)
@@ -1389,11 +1412,12 @@ async function startCamera() {
   const caps = track && track.getCapabilities ? track.getCapabilities() : {};
   $('#camTorch').hidden = !caps.torch;
   $('#camTorch').setAttribute('aria-pressed', 'false');
-  $('#camAuto').hidden = !settings.autoCrop;
+  $('#camAuto').hidden = settings.cropMode === 'off';
+  $('#camAuto').lastChild.textContent = settings.cropMode === 'manual' ? 'MANUAL' : 'AUTO';
   updateCamCount();
   $('#camera').hidden = false;
   camQuad = null;
-  if (settings.autoCrop) camTimer = setInterval(trackDoc, 220);
+  if (settings.cropMode !== 'off') camTimer = setInterval(trackDoc, 220);
 }
 const frameCanvas = document.createElement('canvas');
 function trackDoc() {
@@ -1458,12 +1482,12 @@ $('#camShutter').onclick = async () => {
   const c = scaledCanvas(video, video.videoWidth, video.videoHeight, MAX_SRC);
   const page = newPage(await canvasToBlob(c, 0.92));
   ensureDet(page, c);
-  openEditor(page, { isNew: true, fromCamera: true });
+  openEditor(page, { isNew: true, fromCamera: true, cropFirst: settings.cropMode === 'manual' });
 };
 $('#camInput').onchange = async () => {
   const f = $('#camInput').files[0];
   if (!f) { if (camSession && !camSession.live && !camSession.count) camSession = null; return; }
-  try { openEditor(await pageFromFile(f), { isNew: true, fromCamera: true }); }
+  try { openEditor(await pageFromFile(f), { isNew: true, fromCamera: true, cropFirst: settings.cropMode === 'manual' }); }
   catch { toast('사진을 열 수 없어요. 다시 찍어주세요.'); }
 };
 
@@ -1478,7 +1502,7 @@ let edRaf = 0;
 async function openEditor(page, opts) {
   ed = { page, opts, params: { ...page.params }, crop: page.crop, src: null, full: {}, glare: {}, showOrig: false, cropping: false };
   const idx = pages.indexOf(page);
-  $('#edTitle').textContent = 'P.' + String((idx < 0 ? pages.length : idx) + 1).padStart(2, '0') + (opts.isNew ? ' · NEW' : '');
+  $('#edTitle').textContent = 'P.' + String((idx < 0 ? pages.length : idx) + 1).padStart(2, '0') + (opts.step ? ` · ${opts.step}` : opts.isNew ? ' · NEW' : '');
   setCropMode(false);
   syncControls();
   buildActions();
@@ -1491,6 +1515,7 @@ async function openEditor(page, opts) {
   if (!ed || ed.page !== page) return;
   ensureDet(page, src);
   ed.src = src;
+  if (opts.cropFirst) { enterCrop(); return; }
   await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 30)));
   if (!ed || ed.page !== page) return;
   buildGeo();
@@ -1517,9 +1542,10 @@ function edFull() {
 function drawEditor(now) {
   const run = () => {
     edRaf = 0;
-    if (!ed || !ed.img) return;
+    if (!ed || !ed.src) return;
     const p = ed.params;
     if (ed.cropping) { drawRotated(ed.src, 0, edCanvas); layoutCrop(); }
+    else if (!ed.img) return;
     else if (ed.showOrig) drawRotated(ed.src, p.rot, edCanvas);
     else {
       if (p.mode === 'original') ed.ctx.putImageData(ed.img, 0, 0);
@@ -1574,7 +1600,7 @@ function buildActions() {
     add('i-check', '완료', '', () => commit('done'));
     add('i-camera-plus', '추가하고 계속 찍기', 'primary', () => commit('more'));
   } else {
-    add('i-close', '취소', '', closeEditor);
+    add('i-close', '취소', '', () => { closeEditor(); nextInQueue(); });
     add('i-check', '적용', 'primary', () => commit('apply'));
   }
 }
@@ -1610,7 +1636,7 @@ function commit(kind) {
     const n = camSession ? camSession.count : 1;
     if (camSession && camSession.live) stopCamera(); else camSession = null;
     toast(`${n}장 스캔 완료`);
-  }
+  } else if (kind === 'apply') nextInQueue();
 }
 $('#edMode').addEventListener('click', (e) => {
   const b = e.target.closest('button');
@@ -1635,7 +1661,11 @@ $('#edDeglare').onclick = () => {
   drawEditor();
 };
 $('#edRotate').onclick = () => { if (ed && !ed.cropping) { ed.params.rot = (ed.params.rot + 90) % 360; drawEditor(); } };
-$('#edClose').onclick = () => { if (ed && ed.cropping) { setCropMode(false); drawEditor(true); } else closeEditor(); };
+$('#edClose').onclick = () => {
+  if (ed && ed.cropping && ed.img) { setCropMode(false); drawEditor(true); return; }
+  cropQueue = [];
+  closeEditor();
+};
 {
   const cmp = $('#edCompare');
   const set = (on) => { if (!ed || ed.cropping) return; ed.showOrig = on; cmp.setAttribute('aria-pressed', String(on)); drawEditor(); };
@@ -1658,19 +1688,37 @@ function setCropMode(on) {
   $('#edCompare').hidden = on;
   $('#edCrop').setAttribute('aria-pressed', String(on));
   $('#edRotate').disabled = on;
+  document.querySelector('.ed-stage').classList.toggle('cropping', on);
+  if (!on) $('#loupe').hidden = true;
+}
+// open the corner screen; starts from the page's crop, else the detected outline, else a near-full frame
+function enterCrop() {
+  const det = ed.page.det;
+  ed.draft = (ed.crop && ed.crop.quad ? ed.crop.quad : ed.crop && ed.crop.full ? FULL : det ? det.quad : [[0.06, 0.06], [0.94, 0.06], [0.94, 0.94], [0.06, 0.94]]).map((p) => p.slice());
+  ed.draftAuto = !ed.crop && settings.cropMode === 'auto' && !!det;
+  const retakeHere = !ed.img && ed.opts.isNew && ed.opts.fromCamera;
+  const c = $('#cropCancel');
+  c.innerHTML = icon(retakeHere ? 'i-retake' : 'i-close');
+  c.setAttribute('aria-label', retakeHere ? '다시 찍기' : ed.img ? '자르기 취소' : '자르지 않고 넘어가기');
+  c.title = c.getAttribute('aria-label');
+  setCropMode(true);
+  drawEditor(true);
+}
+function applyCrop(crop) {
+  ed.crop = crop;
+  setCropMode(false);
+  $('#edBusy').hidden = false;
+  setTimeout(() => { if (!ed) return; buildGeo(); drawEditor(true); }, 30);
 }
 $('#edCrop').onclick = () => {
   if (!ed || !ed.src) return;
-  if (ed.cropping) { setCropMode(false); drawEditor(true); return; }
-  const det = ed.page.det;
-  ed.draft = (ed.crop && ed.crop.quad ? ed.crop.quad : ed.crop && ed.crop.full ? FULL : det ? det.quad : [[0.06, 0.06], [0.94, 0.06], [0.94, 0.94], [0.06, 0.94]]).map((p) => p.slice());
-  ed.draftAuto = !ed.crop && settings.autoCrop && !!det;
-  setCropMode(true);
-  drawEditor(true);
+  if (ed.cropping) { if (ed.img) { setCropMode(false); drawEditor(true); } return; }
+  enterCrop();
 };
 function layoutCrop() {
   const q = ed.draft;
   $('#cropPoly').setAttribute('points', q.map(([x, y]) => `${x * 100},${y * 100}`).join(' '));
+  $('#cropShade').setAttribute('d', 'M0 0H100V100H0Z M' + q.map(([x, y]) => `${x * 100} ${y * 100}`).join(' L') + 'Z');
   document.querySelectorAll('#cropUI .handle').forEach((h) => { const [x, y] = q[+h.dataset.k]; h.style.left = x * 100 + '%'; h.style.top = y * 100 + '%'; });
 }
 $('#cropFull').onclick = () => { ed.draft = FULL.map((p) => p.slice()); ed.draftAuto = false; layoutCrop(); flashChip('사진 전체'); };
@@ -1678,52 +1726,78 @@ $('#cropAuto').onclick = () => {
   const det = ed.page.det;
   if (!det) { flashChip('테두리를 못 찾았어요'); return; }
   ed.draft = det.quad.map((p) => p.slice());
-  ed.draftAuto = settings.autoCrop;
+  ed.draftAuto = settings.cropMode === 'auto';
   layoutCrop();
   flashChip('자동 감지');
 };
-$('#cropCancel').onclick = () => { setCropMode(false); drawEditor(true); };
-$('#cropApply').onclick = () => {
-  ed.crop = ed.draftAuto ? undefined : isFull(ed.draft) ? { full: true } : { quad: ed.draft.map((p) => p.slice()) };
-  setCropMode(false);
-  $('#edBusy').hidden = false;
-  setTimeout(() => { if (!ed) return; buildGeo(); drawEditor(true); }, 30);
+$('#cropCancel').onclick = () => {
+  if (ed.img) { setCropMode(false); drawEditor(true); return; }
+  // corner screen came first: retake the shot, or go on to the preview uncropped
+  if (ed.opts.isNew && ed.opts.fromCamera) retake(); else applyCrop(ed.crop);
 };
-document.querySelectorAll('#cropUI .handle').forEach((h) => {
-  const k = +h.dataset.k, loupe = $('#loupe'), lx = loupe.getContext('2d');
-  const move = (e) => {
-    const r = $('#edSheet').getBoundingClientRect();
-    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
-    ed.draft[k] = [x, y];
+$('#cropApply').onclick = () => applyCrop(ed.draftAuto ? undefined : isFull(ed.draft) ? { full: true } : { quad: ed.draft.map((p) => p.slice()) });
+// drag corners: grab the nearest one, keep the grab offset, zoom in a separate corner window
+{
+  const stage = document.querySelector('.ed-stage'), loupe = $('#loupe'), lx = loupe.getContext('2d');
+  const handles = [...document.querySelectorAll('#cropUI .handle')];
+  const clamp = (v) => Math.min(1, Math.max(0, v));
+  let drag = null; // { k, dx, dy, id }
+  const rel = (e) => { const r = $('#edSheet').getBoundingClientRect(); return { r, x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; };
+  stage.addEventListener('pointerdown', (e) => {
+    if (!ed || !ed.cropping) return;
+    const { r, x, y } = rel(e);
+    let k = -1, best = 56; // reach in screen px
+    ed.draft.forEach(([qx, qy], i) => { const d = Math.hypot((qx - x) * r.width, (qy - y) * r.height); if (d < best) { best = d; k = i; } });
+    if (k < 0) return;
+    e.preventDefault();
+    try { stage.setPointerCapture(e.pointerId); } catch {}
+    drag = { k, dx: ed.draft[k][0] - x, dy: ed.draft[k][1] - y, id: e.pointerId };
+    handles[k].classList.add('active');
+    move(e);
+  });
+  stage.addEventListener('pointermove', (e) => { if (drag && e.pointerId === drag.id) move(e); });
+  const end = () => { if (!drag) return; handles[drag.k].classList.remove('active'); drag = null; loupe.hidden = true; };
+  stage.addEventListener('pointerup', end);
+  stage.addEventListener('pointercancel', end);
+  function move(e) {
+    const { r, x, y } = rel(e);
+    ed.draft[drag.k] = [clamp(x + drag.dx), clamp(y + drag.dy)];
     ed.draftAuto = false;
     layoutCrop();
-    // magnifier above the finger
-    const sx = x * ed.src.width, sy = y * ed.src.height, span = (104 / (r.width / ed.src.width)) / 3;
+    drawLoupe(drag.k, r);
+  }
+  function drawLoupe(k, r) {
+    const S = 300, zoom = 3;
+    const W = ed.src.width, H = ed.src.height, span = 150 / ((r.width / W) * zoom), f = S / span;
+    const [nx, ny] = ed.draft[k];
+    const ox = nx * W - span / 2, oy = ny * H - span / 2;
+    loupe.classList.toggle('right', nx < 0.5);
+    loupe.classList.toggle('left', nx >= 0.5);
     loupe.hidden = false;
-    loupe.style.left = x * 100 + '%';
-    loupe.style.top = `calc(${y * 100}% - 86px)`;
-    lx.fillStyle = '#000'; lx.fillRect(0, 0, 208, 208);
-    lx.drawImage(ed.src, sx - span / 2, sy - span / 2, span, span, 0, 0, 208, 208);
-    lx.strokeStyle = '#8C9BFF'; lx.lineWidth = 3;
-    lx.beginPath(); lx.moveTo(104, 84); lx.lineTo(104, 124); lx.moveTo(84, 104); lx.lineTo(124, 104); lx.stroke();
-  };
-  h.addEventListener('pointerdown', (e) => { e.preventDefault(); try { h.setPointerCapture(e.pointerId); } catch {} h.dataset.drag = '1'; move(e); });
-  h.addEventListener('pointermove', (e) => { if (h.dataset.drag) move(e); });
-  const end = () => { delete h.dataset.drag; loupe.hidden = true; };
-  h.addEventListener('pointerup', end);
-  h.addEventListener('pointercancel', end);
-});
+    lx.fillStyle = '#000'; lx.fillRect(0, 0, S, S);
+    lx.drawImage(ed.src, ox, oy, span, span, 0, 0, S, S);
+    const P = (i) => [(ed.draft[i][0] * W - ox) * f, (ed.draft[i][1] * H - oy) * f];
+    lx.lineJoin = 'round';
+    lx.strokeStyle = '#8C9BFF'; lx.lineWidth = 4;
+    lx.beginPath(); lx.moveTo(...P((k + 3) % 4)); lx.lineTo(...P(k)); lx.lineTo(...P((k + 1) % 4)); lx.stroke();
+    lx.strokeStyle = '#fff'; lx.lineWidth = 2;
+    lx.beginPath(); lx.arc(S / 2, S / 2, 16, 0, Math.PI * 2);
+    lx.moveTo(S / 2 - 30, S / 2); lx.lineTo(S / 2 - 18, S / 2); lx.moveTo(S / 2 + 18, S / 2); lx.lineTo(S / 2 + 30, S / 2);
+    lx.moveTo(S / 2, S / 2 - 30); lx.lineTo(S / 2, S / 2 - 18); lx.moveTo(S / 2, S / 2 + 18); lx.lineTo(S / 2, S / 2 + 30);
+    lx.stroke();
+  }
+}
 
 /* =========================================================
    Settings
    ========================================================= */
 function syncSettings() {
   document.querySelectorAll('#setTheme button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.v === settings.theme)));
-  $('#setCrop').checked = settings.autoCrop;
+  document.querySelectorAll('#setCropMode button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.v === settings.cropMode)));
   $('#setFlat').checked = settings.flatten;
   $('#setSkew').checked = settings.deskew;
   $('#setGlare').checked = settings.deglare;
-  $('#rowFlat').classList.toggle('off', !settings.autoCrop);
+  $('#rowFlat').classList.toggle('off', settings.cropMode === 'off');
 }
 $('#btnSettings').onclick = () => { syncSettings(); openSheet('#setSheet'); };
 $('#setTheme').addEventListener('click', (e) => {
@@ -1733,13 +1807,20 @@ $('#setTheme').addEventListener('click', (e) => {
   applyTheme(); saveSettings(); syncSettings();
 });
 let rethumbTimer = 0;
-[['#setCrop', 'autoCrop'], ['#setFlat', 'flatten'], ['#setSkew', 'deskew'], ['#setGlare', 'deglare']].forEach(([sel, key]) => {
+const rethumbAll = () => { clearTimeout(rethumbTimer); rethumbTimer = setTimeout(() => pages.forEach(queueThumb), 250); };
+$('#setCropMode').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b || b.dataset.v === settings.cropMode) return;
+  settings.cropMode = b.dataset.v;
+  saveSettings(); syncSettings();
+  rethumbAll();
+});
+[['#setFlat', 'flatten'], ['#setSkew', 'deskew'], ['#setGlare', 'deglare']].forEach(([sel, key]) => {
   $(sel).addEventListener('change', (e) => {
     settings[key] = e.target.checked;
     saveSettings(); syncSettings();
     if (key === 'deglare') return; // default for new pages only
-    clearTimeout(rethumbTimer);
-    rethumbTimer = setTimeout(() => pages.forEach(queueThumb), 250);
+    rethumbAll();
   });
 });
 
