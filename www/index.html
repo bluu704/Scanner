@@ -164,6 +164,7 @@ main { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding-block: 1
 .cam-bottom { margin-top: auto; position: relative; z-index: 2; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 18px 24px 22px; background: linear-gradient(transparent, rgb(0 0 0 / .65)); }
 .cam-bottom .shutter { width: 78px; height: 78px; border-color: var(--scr-fg); }
 .cam-bottom .shutter span { background: var(--scr-fg); }
+.shutter.busy span { transform: scale(.82); opacity: .55; transition: transform .15s, opacity .15s; }
 .cam-bottom .dbtn { width: 52px; height: 52px; background: var(--scr-raise); }
 .flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; z-index: 3; }
 .flash.on { animation: flash .28s ease-out; }
@@ -493,7 +494,7 @@ input[type="range"]:disabled { opacity: .35; }
 (() => {
 'use strict';
 const $ = (s) => document.querySelector(s);
-const MAX_SRC = 2400;      // long side kept for each page
+const MAX_SRC = 3508;      // long side kept for each page (A4 at 300 dpi)
 const THUMB = 520;         // long side of grid thumbnails
 const MODE_LABEL = { original: '원본', color: '컬러', gray: '회색조', bw: '흑백' };
 const MODE_ICON = { original: 'i-m-original', color: 'i-m-color', gray: 'i-m-gray', bw: 'i-m-bw' };
@@ -564,6 +565,9 @@ async function blobToCanvas(blob, maxSide) {
 function cloneCanvas(src) { return scaledCanvas(src, src.width, src.height, Infinity); }
 function canvasToBlob(c, q = 0.92) {
   return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('encode'))), 'image/jpeg', q));
+}
+function canvasToPng(c) {
+  return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('encode'))), 'image/png'));
 }
 function drawRotated(src, rot, dst) {
   const q = ((rot % 360) + 360) % 360;
@@ -695,7 +699,72 @@ function refineQuad(q, pts, diag) {
     return Math.hypot(p[0] - c[0], p[1] - c[1]) < 0.015 * diag ? p : c;
   });
 }
-function detectDoc(src, maxSide = 400) {
+/* The outline is found at 400px, where one pixel is several in the photo. Re-find each corner
+   at up to 1600px from the strongest paper->desk edge on the two sides next to it. */
+function refineCorners(src, quadN) {
+  const g = scaledCanvas(src, src.width, src.height, 1600);
+  const w = g.width, h = g.height, n = w * h;
+  const d = g.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+  let S = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) { const r = d[j], gg = d[j + 1], b = d[j + 2]; S[i] = lum(r, gg, b) - 1.1 * (Math.max(r, gg, b) - Math.min(r, gg, b)); }
+  S = boxBlur(S, w, h, 1);
+  const at = (x, y) => {
+    if (x < 0 || y < 0 || x > w - 1.001 || y > h - 1.001) return NaN;
+    const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * w + x0;
+    return (S[i] * (1 - fx) + S[i + 1] * fx) * (1 - fy) + (S[i + w] * (1 - fx) + S[i + w + 1] * fx) * fy;
+  };
+  const q = quadN.map(([x, y]) => [x * w, y * h]);
+  const cx = q.reduce((a, p) => a + p[0], 0) / 4, cy = q.reduce((a, p) => a + p[1], 0) / 4;
+  const diag = Math.hypot(w, h), R = Math.max(6, Math.round(0.012 * diag));
+  const edgeLine = (A, B) => {
+    const dx = B[0] - A[0], dy = B[1] - A[1], L = Math.hypot(dx, dy), ux = dx / L, uy = dy / L;
+    let nx = -uy, ny = ux;
+    if ((A[0] + dx / 2 - cx) * nx + (A[1] + dy / 2 - cy) * ny < 0) { nx = -nx; ny = -ny; }
+    const pts = [];
+    for (let k = 0; k < 12; k++) {
+      const sx = A[0] + ux * L * (0.03 + (0.2 * k) / 11), sy = A[1] + uy * L * (0.03 + (0.2 * k) / 11);
+      const prof = [];
+      for (let t = -R - 1; t <= R + 1; t++) prof.push(at(sx + nx * t, sy + ny * t));
+      let best = 0, bt = 0;
+      for (let m = 1; m < prof.length - 1; m++) {
+        const D = prof[m + 1] - prof[m - 1];
+        if (D < best) { best = D; bt = m; }
+      }
+      if (best > -14 || bt < 2 || bt > prof.length - 3) continue;
+      const Dm = prof[bt] - prof[bt - 2], D0 = best, Dp = prof[bt + 2] - prof[bt];
+      const den = Dm - 2 * D0 + Dp, off = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (Dm - Dp)) / den)) : 0;
+      const t = bt - R - 1 + off;
+      pts.push([sx + nx * t, sy + ny * t]);
+    }
+    if (pts.length < 6) return null;
+    let line = fitLine(pts);
+    const keep = pts.filter((p) => Math.abs((p[0] - line[0]) * line[3] - (p[1] - line[1]) * line[2]) < 1.5);
+    if (keep.length < 6) return null;
+    line = fitLine(keep);
+    if (Math.abs(line[2] * uy - line[3] * ux) > Math.sin((4 * Math.PI) / 180)) return null; // turned too far from the side
+    return line;
+  };
+  const out = q.map((c, k) => {
+    const l1 = edgeLine(c, q[(k + 1) % 4]), l2 = edgeLine(c, q[(k + 3) % 4]);
+    if (!l1 || !l2) return c;
+    const den = l1[2] * l2[3] - l1[3] * l2[2];
+    if (Math.abs(den) < 0.2) return c;
+    const t = ((l2[0] - l1[0]) * l2[3] - (l2[1] - l1[1]) * l2[2]) / den;
+    const p = [l1[0] + l1[2] * t, l1[1] + l1[3] * t];
+    return Math.hypot(p[0] - c[0], p[1] - c[1]) < 0.012 * diag ? p : c;
+  });
+  return out.map(([x, y]) => [x / w, y / h]);
+}
+function fitLine(pts) {
+  let mx = 0, my = 0;
+  for (const p of pts) { mx += p[0]; my += p[1]; }
+  mx /= pts.length; my /= pts.length;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (const p of pts) { const a = p[0] - mx, b = p[1] - my; sxx += a * a; sxy += a * b; syy += b * b; }
+  const th = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  return [mx, my, Math.cos(th), Math.sin(th)];
+}
+function detectDoc(src, maxSide = 400, refine = true) {
   const c = scaledCanvas(src, src.width, src.height, maxSide);
   const w = c.width, h = c.height, n = w * h;
   const d = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
@@ -776,7 +845,9 @@ function detectDoc(src, maxSide = 400) {
   if (ratio < 0.8 || ratio > 1.2) return null;
   const frame = [[0, 0], [w, 0], [w, h], [0, h]];
   if (quad.every((p, k) => Math.hypot(p[0] - frame[k][0], p[1] - frame[k][1]) < 0.025 * diag)) return null;
-  return { quad: quad.map(([x, y]) => [x / w, y / h]), mask, mw: w, mh: h };
+  let qn = quad.map(([x, y]) => [x / w, y / h]);
+  if (refine && Math.max(src.width, src.height) > maxSide * 1.5) qn = refineCorners(src, qn);
+  return { quad: qn, mask, mw: w, mh: h };
 }
 
 /* =========================================================
@@ -907,8 +978,16 @@ function resampleCurve(pts, n, eps) {
   }
   return [xs, ys];
 }
-function warp(src, quad, curves) {
-  const W = src.width, H = src.height;
+// Catmull-Rom weights for one axis (sharper than bilinear at the same cost per tap)
+function cubicW(f, w) {
+  const f2 = f * f, f3 = f2 * f;
+  w[0] = (-f3 + 2 * f2 - f) / 2; w[1] = (3 * f3 - 5 * f2 + 2) / 2; w[2] = (-3 * f3 + 4 * f2 + f) / 2; w[3] = (f3 - f2) / 2;
+}
+/* One resampling pass for the whole geometry: perspective (homography), curl (Coons patch)
+   and the deskew rotation are composed per output pixel, so the photo is interpolated once. */
+function warp(src, quad, curves, angle = 0, fill = null, cubic = true) {
+  const W = src.width, H = src.height, whole = !quad;
+  quad = quad || [[0, 0], [1, 0], [1, 1], [0, 1]];
   const q = quad.map(([x, y]) => [x * W, y * H]);
   const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
   const Wr = (d(q[0], q[1]) + d(q[3], q[2])) / 2, Hr = (d(q[0], q[3]) + d(q[1], q[2])) / 2;
@@ -926,7 +1005,7 @@ function warp(src, quad, curves) {
   }
   const s = Math.min(1, Math.max(W, H) / Math.max(Wo, Ho));
   const ow = Math.max(8, Math.round(Wo * s)), oh = Math.max(8, Math.round(Ho * s));
-  const eps = 0.007;
+  const eps = whole ? 0 : 0.005;
   const [Tx, Ty] = resampleCurve(T, ow, eps), [Bx, By] = resampleCurve(B, ow, eps);
   const [Lx, Ly] = resampleCurve(Lc, oh, eps), [Rx, Ry] = resampleCurve(Rc, oh, eps);
   const sd = src.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data;
@@ -934,22 +1013,53 @@ function warp(src, quad, curves) {
   out.width = ow; out.height = oh;
   const octx = out.getContext('2d', { willReadFrequently: true });
   const od = octx.createImageData(ow, oh), o = od.data;
+  const fc = fill || [255, 255, 255];
+  const a = (angle * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a), rot = Math.abs(angle) > 1e-3;
+  const cx = (ow - 1) / 2, cy = (oh - 1) / 2, wx = new Float64Array(4), wy = new Float64Array(4);
+  const at = (arr, f, n) => { const i0 = f | 0, i1 = i0 + 1 < n ? i0 + 1 : i0, t = f - i0; return arr[i0] + (arr[i1] - arr[i0]) * t; };
   for (let j = 0; j < oh; j++) {
-    const v = eps + ((1 - 2 * eps) * j) / (oh - 1);
     for (let i = 0; i < ow; i++) {
-      const u = eps + ((1 - 2 * eps) * i) / (ow - 1);
-      // Coons patch; corners are (0,0) (Wr,0) (0,Hr) (Wr,Hr)
-      const px = (1 - v) * Tx[i] + v * Bx[i] + (1 - u) * Lx[j] + u * Rx[j] - u * Wr;
-      const py = (1 - v) * Ty[i] + v * By[i] + (1 - u) * Ly[j] + u * Ry[j] - v * Hr;
+      const k = (j * ow + i) * 4;
+      let fi = i, fj = j;
+      if (rot) {
+        const dx = i - cx, dy = j - cy;
+        fi = cx + dx * ca - dy * sa; fj = cy + dx * sa + dy * ca;
+        if (fi < -0.5 || fj < -0.5 || fi > ow - 0.5 || fj > oh - 0.5) { o[k] = fc[0]; o[k + 1] = fc[1]; o[k + 2] = fc[2]; o[k + 3] = 255; continue; }
+        fi = fi < 0 ? 0 : fi > ow - 1 ? ow - 1 : fi; fj = fj < 0 ? 0 : fj > oh - 1 ? oh - 1 : fj;
+      }
+      const u = eps + ((1 - 2 * eps) * fi) / (ow - 1), v = eps + ((1 - 2 * eps) * fj) / (oh - 1);
+      let px, py;
+      if (!curves) { px = u * Wr; py = v * Hr; } // flat page: the patch is just the rectangle
+      else {
+        // Coons patch; corners are (0,0) (Wr,0) (0,Hr) (Wr,Hr)
+        const tx = rot ? at(Tx, fi, ow) : Tx[i], ty = rot ? at(Ty, fi, ow) : Ty[i];
+        const bx = rot ? at(Bx, fi, ow) : Bx[i], by = rot ? at(By, fi, ow) : By[i];
+        const lx = rot ? at(Lx, fj, oh) : Lx[j], ly = rot ? at(Ly, fj, oh) : Ly[j];
+        const rx = rot ? at(Rx, fj, oh) : Rx[j], ry = rot ? at(Ry, fj, oh) : Ry[j];
+        px = (1 - v) * tx + v * bx + (1 - u) * lx + u * rx - u * Wr;
+        py = (1 - v) * ty + v * by + (1 - u) * ly + u * ry - v * Hr;
+      }
       const w = Hs[6] * px + Hs[7] * py + 1;
       let sx = (Hs[0] * px + Hs[1] * py + Hs[2]) / w, sy = (Hs[3] * px + Hs[4] * py + Hs[5]) / w;
       sx = sx < 0 ? 0 : sx > W - 1.001 ? W - 1.001 : sx;
       sy = sy < 0 ? 0 : sy > H - 1.001 ? H - 1.001 : sy;
       const x0 = sx | 0, y0 = sy | 0, fx = sx - x0, fy = sy - y0;
-      const a = (y0 * W + x0) * 4, b = a + 4, c = a + W * 4, e = c + 4;
-      const k = (j * ow + i) * 4;
-      for (let ch = 0; ch < 3; ch++) {
-        o[k + ch] = (sd[a + ch] * (1 - fx) + sd[b + ch] * fx) * (1 - fy) + (sd[c + ch] * (1 - fx) + sd[e + ch] * fx) * fy;
+      if (cubic && x0 > 0 && y0 > 0 && x0 < W - 2 && y0 < H - 2) {
+        cubicW(fx, wx); cubicW(fy, wy);
+        let r = 0, g = 0, bl = 0;
+        for (let m = 0; m < 4; m++) {
+          const row = ((y0 - 1 + m) * W + x0 - 1) * 4, wm = wy[m];
+          for (let n = 0; n < 4; n++) {
+            const ww = wm * wx[n], idx = row + n * 4;
+            r += sd[idx] * ww; g += sd[idx + 1] * ww; bl += sd[idx + 2] * ww;
+          }
+        }
+        o[k] = r; o[k + 1] = g; o[k + 2] = bl;
+      } else {
+        const p0 = (y0 * W + x0) * 4, p1 = p0 + 4, p2 = p0 + W * 4, p3 = p2 + 4;
+        for (let ch = 0; ch < 3; ch++) {
+          o[k + ch] = (sd[p0 + ch] * (1 - fx) + sd[p1 + ch] * fx) * (1 - fy) + (sd[p2 + ch] * (1 - fx) + sd[p3 + ch] * fx) * fy;
+        }
       }
       o[k + 3] = 255;
     }
@@ -991,37 +1101,58 @@ function estimateSkew(canvas) {
   for (let k = 0; k < 400; k++) { const i = ((k * 7919) % n) * 4; samp.push([lum(d[i], d[i + 1], d[i + 2]), d[i], d[i + 1], d[i + 2]]); }
   samp.sort((a, b) => a[0] - b[0]);
   const p = samp[Math.floor(samp.length * 0.8)];
-  return { angle: best, fill: `rgb(${p[1]},${p[2]},${p[3]})` };
+  return { angle: best, fill: [p[1], p[2], p[3]] };
 }
-function deskew(canvas) {
-  const { angle, fill } = estimateSkew(canvas);
-  if (Math.abs(angle) < 0.2) return { canvas, angle: 0 };
-  const out = document.createElement('canvas');
-  out.width = canvas.width; out.height = canvas.height;
-  const x = out.getContext('2d', { willReadFrequently: true });
-  x.fillStyle = fill; x.fillRect(0, 0, out.width, out.height);
-  x.translate(out.width / 2, out.height / 2);
-  x.rotate((-angle * Math.PI) / 180);
-  x.imageSmoothingQuality = 'high';
-  x.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
-  return { canvas: out, angle };
+/* paint over slivers of desk left along the page edges (rows/columns much darker than the paper) */
+function cleanBorders(c) {
+  const w = c.width, h = c.height, ctx = c.getContext('2d', { willReadFrequently: true });
+  const img = ctx.getImageData(0, 0, w, h), d = img.data;
+  const samp = [];
+  for (let k = 0; k < 1500; k++) { const i = ((k * 7919) % (w * h)) * 4; samp.push([lum(d[i], d[i + 1], d[i + 2]), d[i], d[i + 1], d[i + 2]]); }
+  samp.sort((a, b) => a[0] - b[0]);
+  const P = samp[Math.floor(samp.length * 0.8)], lim = P[0] * 0.72;
+  const rowL = (y) => { let s = 0, n = 0; for (let x = (w * 0.1) | 0; x < w * 0.9; x += 2) { const i = (y * w + x) * 4; s += lum(d[i], d[i + 1], d[i + 2]); n++; } return s / n; };
+  const colL = (x) => { let s = 0, n = 0; for (let y = (h * 0.1) | 0; y < h * 0.9; y += 2) { const i = (y * w + x) * 4; s += lum(d[i], d[i + 1], d[i + 2]); n++; } return s / n; };
+  const mr = Math.round(h * 0.025), mc = Math.round(w * 0.025);
+  let t = 0, b = 0, l = 0, r = 0;
+  while (t < mr && rowL(t) < lim) t++;
+  while (b < mr && rowL(h - 1 - b) < lim) b++;
+  while (l < mc && colL(l) < lim) l++;
+  while (r < mc && colL(w - 1 - r) < lim) r++;
+  if (!(t || b || l || r)) return c;
+  // one more line covers the soft edge of the shadow
+  ctx.fillStyle = `rgb(${P[1]},${P[2]},${P[3]})`;
+  if (t) ctx.fillRect(0, 0, w, t + 1);
+  if (b) ctx.fillRect(0, h - b - 1, w, b + 1);
+  if (l) ctx.fillRect(0, 0, l + 1, h);
+  if (r) ctx.fillRect(w - r - 1, 0, r + 1, h);
+  return c;
 }
 
-/* page geometry: crop/flatten (settings or the page's manual crop), then deskew */
+/* page geometry: crop/flatten (settings or the page's manual crop) and deskew, resampled once */
 function geometry(det, crop, src) {
   let quad = null;
   const manual = !!(crop && crop.quad);
   if (manual) quad = crop.quad;
   else if (!crop && settings.cropMode === 'auto' && det) quad = det.quad;
   const info = { cropped: !!quad, flattened: false, angle: 0 };
-  let c = src;
+  let c = src, curves = null;
   if (quad) {
     // corners the user placed get straight edges; only the auto outline is followed for curl
-    const curves = !manual && settings.flatten && det ? findCurves(det, quad) : null;
+    curves = !manual && settings.flatten && det ? findCurves(det, quad) : null;
     info.flattened = !!curves;
-    c = warp(src, quad, curves);
   }
-  if (settings.deskew) { const r = deskew(c); c = r.canvas; info.angle = r.angle; }
+  let angle = 0, fill = null;
+  if (settings.deskew) {
+    // measure the text angle on a small, already-straightened copy
+    const small = scaledCanvas(src, src.width, src.height, 1000);
+    const r = estimateSkew(quad ? warp(small, quad, curves, 0, null, false) : small);
+    if (Math.abs(r.angle) >= 0.2) { angle = r.angle; fill = r.fill; }
+  }
+  info.angle = angle;
+  if (!quad && !angle) return { canvas: c, info };
+  c = warp(src, quad, curves, angle, fill);
+  if (quad && !manual) c = cleanBorders(c);
   return { canvas: c, info };
 }
 function ensureDet(page, src) {
@@ -1054,6 +1185,7 @@ function analyze(img, deglare) {
     }
   }
   for (let c = 0; c < n; c++) { if (c2[c]) { R[c] /= c2[c]; G[c] /= c2[c]; B[c] /= c2[c]; } else { R[c] = G[c] = B[c] = sumL[c]; } }
+  protectFigures(d, W, H, cx, sw, sh, cnt, R, G, B);
   {
     const L0 = new Float32Array(n);
     for (let c = 0; c < n; c++) L0[c] = lum(R[c], G[c], B[c]);
@@ -1098,6 +1230,75 @@ function analyze(img, deglare) {
   }
   return { sw, sh, R, G, B, gl, glarePct };
 }
+/* Paper pixels cluster tightly around a cell's bright level (text covers little of it).
+   Cells that spread out (photos, drawings), carry colour, or are very dark are not paper:
+   their "paper" level is taken from the paper around them, so the figure keeps its tones
+   instead of being divided by itself and bleached. */
+function protectFigures(d, W, H, cx, sw, sh, cnt, R, G, B) {
+  const n = sw * sh, Lb = new Float32Array(n), near = new Float32Array(n);
+  for (let c = 0; c < n; c++) Lb[c] = lum(R[c], G[c], B[c]);
+  for (let y = 0; y < H; y++) {
+    const row = Math.min(sh - 1, ((y * sh) / H) | 0) * sw;
+    for (let x = 0, i = y * W * 4; x < W; x++, i += 4) {
+      const c = row + cx[x];
+      if (Math.abs(lum(d[i], d[i + 1], d[i + 2]) - Lb[c]) < 0.08 * Lb[c] + 8) near[c]++;
+    }
+  }
+  const frac = new Float32Array(n), sat = new Float32Array(n), paperS = [];
+  for (let c = 0; c < n; c++) {
+    frac[c] = near[c] / (cnt[c] || 1);
+    // saturation relative to brightness: a shadow darkens paper but keeps its tint, a picture changes it
+    sat[c] = (Math.max(R[c], G[c], B[c]) - Math.min(R[c], G[c], B[c])) / Math.max(20, Lb[c]);
+    if (frac[c] > 0.5) paperS.push(sat[c]);
+  }
+  if (paperS.length < n * 0.25) return;
+  const med = (a) => a.sort((p, q) => p - q)[a.length >> 1];
+  const sMed = med(paperS);
+  // brightest paper nearby (lighting changes slowly; a figure is much darker than the paper around it)
+  const rr = Math.max(2, Math.round(Math.max(sw, sh) / 10));
+  const mxH = new Float32Array(n), env0 = new Float32Array(n);
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    let m = 0;
+    for (let k = Math.max(0, x - rr); k <= Math.min(sw - 1, x + rr); k++) if (frac[y * sw + k] > 0.5 && Lb[y * sw + k] > m) m = Lb[y * sw + k];
+    mxH[y * sw + x] = m;
+  }
+  for (let x = 0; x < sw; x++) for (let y = 0; y < sh; y++) {
+    let m = 0;
+    for (let k = Math.max(0, y - rr); k <= Math.min(sh - 1, y + rr); k++) if (mxH[k * sw + x] > m) m = mxH[k * sw + x];
+    env0[y * sw + x] = m;
+  }
+  const env = boxBlur(env0, sw, sh, Math.max(1, rr >> 1));
+  let wv = new Float32Array(n), bad = 0;
+  for (let c = 0; c < n; c++) {
+    const rel = env[c] > 1 ? Lb[c] / env[c] : 1;
+    // shadowed paper stays uniform and keeps the paper's tint, so only dark cells that are also busy or tinted count
+    const fig = rel < 0.45 || frac[c] < 0.3 || sat[c] > sMed + 0.15 || (rel < 0.85 && (frac[c] < 0.6 || sat[c] > sMed + 0.07));
+    wv[c] = fig ? 0 : 1; bad += fig;
+  }
+  if (bad < n * 0.02 || bad > n * 0.7) return;
+  // grow the figure mask by one cell so its soft rim does not leak into the estimate
+  const grown = Float32Array.from(wv);
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    if (!wv[y * sw + x]) continue;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const yy = y + dy, xx = x + dx;
+      if (yy >= 0 && xx >= 0 && yy < sh && xx < sw && !wv[yy * sw + xx]) { grown[y * sw + x] = 0; }
+    }
+  }
+  wv = grown;
+  const done = Uint8Array.from(wv);
+  const wr = new Float32Array(n), wg = new Float32Array(n), wb = new Float32Array(n);
+  for (let c = 0; c < n; c++) { wr[c] = R[c] * wv[c]; wg[c] = G[c] * wv[c]; wb[c] = B[c] * wv[c]; }
+  for (let rad = 1; rad <= Math.max(sw, sh); rad *= 2) {
+    const bw = boxBlur(wv, sw, sh, rad), br = boxBlur(wr, sw, sh, rad), bg = boxBlur(wg, sw, sh, rad), bb = boxBlur(wb, sw, sh, rad);
+    let left = 0;
+    for (let c = 0; c < n; c++) {
+      if (done[c]) continue;
+      if (bw[c] > 0.02) { R[c] = br[c] / bw[c]; G[c] = bg[c] / bw[c]; B[c] = bb[c] / bw[c]; done[c] = 1; } else left++;
+    }
+    if (!left) break;
+  }
+}
 function buildFull(img, an) {
   const { width: W, height: H, data: d } = img;
   const { sw, sh, R, G, B, gl } = an;
@@ -1138,13 +1339,19 @@ function renderPixels(img, full, p, out) {
   if (p.mode === 'original') { o.set(d); return out; }
   const t = p.white / 100;
   const { corr, norm } = full;
+  const W = img.width, H = img.height;
   if (p.mode === 'bw') {
-    const thr = 205 - 110 * t;
+    // threshold against the local neighbourhood: faint strokes inside text survive, paper noise does not
+    const Ln = new Float32Array(N);
+    for (let i = 0, j = 0; i < N; i++, j += 3) Ln[i] = lum(norm[j], norm[j + 1], norm[j + 2]);
+    const loc = boxBlur(Ln, W, H, Math.max(6, Math.round(Math.max(W, H) / 60)));
+    const off = 12 + 45 * t, hi = 222 - 35 * t, lo = 70;
     for (let i = 0; i < N; i++) {
-      const j = i * 3, q = i * 4;
-      const v = (lum(norm[j], norm[j + 1], norm[j + 2]) - thr) * 4 + 128;
+      const thr = Math.min(hi, Math.max(lo, loc[i] - off)), q = i * 4;
+      const v = (Ln[i] - thr) * 4 + 128;
       o[q] = o[q + 1] = o[q + 2] = v; o[q + 3] = 255;
     }
+    despeckle(o, W, H, Math.max(2, Math.round(6 * (Math.max(W, H) / 3500) ** 2)));
     return out;
   }
   const k = Math.min(1, t * 1.6), Wp = 255 - 60 * t, Bp = 4 + 42 * t, sc = 255 / (Wp - Bp), sat = 1 + 0.3 * t;
@@ -1158,7 +1365,47 @@ function renderPixels(img, full, p, out) {
     if (gray) { r = g = b = l; } else { r = l + (r - l) * sat; g = l + (g - l) * sat; b = l + (b - l) * sat; }
     o[q] = r; o[q + 1] = g; o[q + 2] = b; o[q + 3] = 255;
   }
+  sharpen(o, W, H, 0.4 + 0.6 * t);
   return out;
+}
+/* unsharp mask on lightness; a small dead zone keeps paper grain from being boosted */
+function sharpen(o, W, H, amt) {
+  const N = W * H, L = new Float32Array(N);
+  for (let i = 0, q = 0; i < N; i++, q += 4) L[i] = lum(o[q], o[q + 1], o[q + 2]);
+  const r = Math.max(W, H) > 2600 ? 2 : 1;
+  const bl = boxBlur(boxBlur(L, W, H, r), W, H, r);
+  for (let i = 0, q = 0; i < N; i++, q += 4) {
+    let e = L[i] - bl[i];
+    if (e > -2 && e < 2) continue;
+    e = (e > 0 ? e - 2 : e + 2) * amt;
+    o[q] += e; o[q + 1] += e; o[q + 2] += e;
+  }
+}
+/* drop black specks smaller than minArea pixels (dust, sensor noise) */
+function despeckle(o, W, H, minArea) {
+  const N = W * H, seen = new Uint8Array(N), stack = new Int32Array(N), comp = new Int32Array(minArea + 1);
+  for (let s = 0; s < N; s++) {
+    if (seen[s] || o[s * 4] >= 128) continue;
+    let sp = 0, cn = 0;
+    stack[sp++] = s; seen[s] = 1;
+    while (sp) {
+      const p = stack[--sp];
+      if (cn <= minArea) comp[cn] = p;
+      cn++;
+      const x = p % W, y = (p - x) / W;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= H) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= W) continue;
+          const k = yy * W + xx;
+          if (!seen[k] && o[k * 4] < 128) { seen[k] = 1; stack[sp++] = k; }
+        }
+      }
+    }
+    if (cn <= minArea) for (let m = 0; m < cn; m++) { const q = comp[m] * 4; o[q] = o[q + 1] = o[q + 2] = 255; }
+  }
 }
 
 async function processPage(page, maxSide) {
@@ -1235,7 +1482,7 @@ function newPage(blob, sample = false) {
 }
 async function pageFromFile(file) {
   const c = await blobToCanvas(file, MAX_SRC);
-  const p = newPage(await canvasToBlob(c, 0.92));
+  const p = newPage(await canvasToBlob(c, 0.95));
   ensureDet(p, c);
   return p;
 }
@@ -1464,7 +1711,7 @@ function trackDoc() {
   const vw = video.videoWidth, vh = video.videoHeight, s = 320 / Math.max(vw, vh);
   frameCanvas.width = Math.round(vw * s); frameCanvas.height = Math.round(vh * s);
   frameCanvas.getContext('2d', { willReadFrequently: true }).drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
-  const det = detectDoc(frameCanvas, 320);
+  const det = detectDoc(frameCanvas, 320, false);
   if (det) {
     camMiss = 0;
     camQuad = camQuad ? camQuad.map((p, k) => [p[0] + (det.quad[k][0] - p[0]) * 0.6, p[1] + (det.quad[k][1] - p[1]) * 0.6]) : det.quad;
@@ -1514,14 +1761,85 @@ $('#camTorch').onclick = async () => {
   const b = $('#camTorch'), on = b.getAttribute('aria-pressed') !== 'true';
   try { await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: on }] }); b.setAttribute('aria-pressed', String(on)); } catch {}
 };
+/* A real still photo (full sensor, proper focus and noise processing) instead of a video frame.
+   Its orientation is checked against the preview, since some phones return it sideways. */
+let imgCap = null, imgCapTrack = null, shooting = false;
+async function takeStill() {
+  const track = stream && stream.getVideoTracks()[0];
+  if (!track || track.readyState !== 'live' || typeof ImageCapture === 'undefined') return null;
+  if (imgCapTrack !== track) { imgCap = new ImageCapture(track); imgCapTrack = track; }
+  const opts = {};
+  try {
+    const pc = await imgCap.getPhotoCapabilities();
+    if (pc.imageWidth && pc.imageWidth.max) opts.imageWidth = pc.imageWidth.max;
+    if (pc.imageHeight && pc.imageHeight.max) opts.imageHeight = pc.imageHeight.max;
+  } catch {}
+  const timeout = new Promise((r) => setTimeout(() => r(null), 6000));
+  const shot = imgCap.takePhoto(opts).catch(() => imgCap.takePhoto()).catch(() => null);
+  return Promise.race([shot, timeout]);
+}
+function grayThumb(src, sw, sh, crop) {
+  const c = document.createElement('canvas'); c.width = 48; c.height = Math.max(8, Math.round((48 * crop[3]) / crop[2]));
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(src, crop[0], crop[1], crop[2], crop[3], 0, 0, c.width, c.height);
+  const d = x.getImageData(0, 0, c.width, c.height).data, g = new Float32Array(c.width * c.height);
+  let m = 0;
+  for (let i = 0; i < g.length; i++) { g[i] = lum(d[i * 4], d[i * 4 + 1], d[i * 4 + 2]); m += g[i]; }
+  m /= g.length;
+  let v = 0;
+  for (let i = 0; i < g.length; i++) { g[i] -= m; v += g[i] * g[i]; }
+  v = Math.sqrt(v) || 1;
+  for (let i = 0; i < g.length; i++) g[i] /= v;
+  return { g, w: c.width, h: c.height };
+}
+// rotate the still (0/90/180/270) to whichever orientation best matches the preview frame
+function matchOrientation(photo, frame) {
+  const fw = frame.width, fh = frame.height, fa = fw / fh;
+  const ref = grayThumb(frame, fw, fh, [0, 0, fw, fh]);
+  let best = null;
+  for (const rot of [0, 90, 180, 270]) {
+    const r = document.createElement('canvas');
+    drawRotated(scaledCanvas(photo, photo.width, photo.height, 400), rot, r);
+    // the preview shows the middle of the sensor; crop the still to the preview's shape
+    let cw = r.width, ch = r.height;
+    if (cw / ch > fa) cw = ch * fa; else ch = cw / fa;
+    const t = grayThumb(r, r.width, r.height, [(r.width - cw) / 2, (r.height - ch) / 2, cw, ch]);
+    if (t.w !== ref.w || t.h !== ref.h) continue;
+    let sc = 0;
+    for (let i = 0; i < t.g.length; i++) sc += t.g[i] * ref.g[i];
+    if (!best || sc > best.sc) best = { rot, sc };
+  }
+  if (!best || best.sc < 0.5) return null;
+  if (!best.rot) return photo;
+  const out = document.createElement('canvas');
+  drawRotated(photo, best.rot, out);
+  return out;
+}
 $('#camShutter').onclick = async () => {
-  if (!video.videoWidth) return;
+  if (!video.videoWidth || shooting) return;
+  shooting = true;
+  $('#camShutter').classList.add('busy');
   const fl = $('#flash');
   fl.classList.remove('on'); void fl.offsetWidth; fl.classList.add('on');
-  const c = scaledCanvas(video, video.videoWidth, video.videoHeight, MAX_SRC);
-  const page = newPage(await canvasToBlob(c, 0.92));
-  ensureDet(page, c);
-  openEditor(page, { isNew: true, fromCamera: true });
+  try {
+    const frame = scaledCanvas(video, video.videoWidth, video.videoHeight, MAX_SRC);
+    let c = null;
+    try {
+      const blob = await takeStill();
+      if (blob) {
+        const ph = await blobToCanvas(blob, MAX_SRC);
+        // keep the still only when it is sharper (bigger) than the frame and shows the same view
+        if (ph.width * ph.height > frame.width * frame.height * 1.2) c = matchOrientation(ph, frame);
+      }
+    } catch {}
+    if (!c) c = frame;
+    const page = newPage(await canvasToBlob(c, 0.95));
+    ensureDet(page, c);
+    openEditor(page, { isNew: true, fromCamera: true });
+  } finally {
+    shooting = false;
+    $('#camShutter').classList.remove('busy');
+  }
 };
 $('#camInput').onchange = async () => {
   const f = $('#camInput').files[0];
@@ -1952,18 +2270,20 @@ $('#exGo').onclick = async () => {
       for (let i = 0; i < total; i++) {
         progress(i, total, `${i + 1} / ${total}`);
         const c = await processPage(list[i], MAX_SRC);
-        const u8 = new Uint8Array(await (await canvasToBlob(c, 0.88)).arrayBuffer());
+        // b&w pages go in lossless (crisp text, no JPEG halos, and small since it is mostly white)
+        const png = list[i].params.mode === 'bw', fmt = png ? 'PNG' : 'JPEG';
+        const u8 = new Uint8Array(await (await (png ? canvasToPng(c) : canvasToBlob(c, 0.9))).arrayBuffer());
         if (ex.size === 'a4') {
           const land = c.width > c.height, pw = land ? 297 : 210, ph = land ? 210 : 297;
           if (!doc) doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: land ? 'l' : 'p', compress: true });
           else doc.addPage('a4', land ? 'l' : 'p');
           const s = Math.min(pw / c.width, ph / c.height), w = c.width * s, h = c.height * s;
-          doc.addImage(u8, 'JPEG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
+          doc.addImage(u8, fmt, (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
         } else {
           const mm = 25.4 / 200, pw = c.width * mm, ph = c.height * mm, o = pw > ph ? 'l' : 'p';
           if (!doc) doc = new jsPDF({ unit: 'mm', format: [pw, ph], orientation: o, compress: true });
           else doc.addPage([pw, ph], o);
-          doc.addImage(u8, 'JPEG', 0, 0, pw, ph, undefined, 'FAST');
+          doc.addImage(u8, fmt, 0, 0, pw, ph, undefined, 'FAST');
         }
       }
       progress(total, total, 'PDF…');
@@ -1974,7 +2294,8 @@ $('#exGo').onclick = async () => {
       for (let i = 0; i < total; i++) {
         progress(i, total, `${i + 1} / ${total}`);
         const c = await processPage(list[i], MAX_SRC);
-        files.push({ name: total > 1 ? `${name}_${String(i + 1).padStart(2, '0')}.jpg` : `${name}.jpg`, blob: await canvasToBlob(c, 0.92) });
+        const png = list[i].params.mode === 'bw', ext = png ? 'png' : 'jpg';
+        files.push({ name: total > 1 ? `${name}_${String(i + 1).padStart(2, '0')}.${ext}` : `${name}.${ext}`, blob: await (png ? canvasToPng(c) : canvasToBlob(c, 0.93)) });
       }
       if (total === 1) {
         finishExport((await saveFile(files[0].blob, files[0].name)) ? `${files[0].name} 저장함` : '저장을 취소했어요');
